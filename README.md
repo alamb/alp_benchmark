@@ -30,11 +30,26 @@ This will print a textual report. Example reports:
 
 ## Diagrams
 There is a python script that post-processes the benchmark results and generates diagrams.
+It requires [uv](https://docs.astral.sh/uv/), which fetches the dependencies
+(matplotlib) automatically — no venv needed.
 
 ```shell
 # Create diagrams from kosta.md in diagrams/kosta
 ./diagrams.sh reports/kosta.md
+
+# Equivalent (diagrams.py declares its dependencies inline, PEP 723)
+./diagrams.py reports/kosta.md
 ```
+
+This creates in `diagrams/<report name>/`:
+
+| File | Contents |
+|---|---|
+| `compression_speed.png` | Compression GB/s per dataset, PLAIN / PLAIN + ZSTD / ALP |
+| `decompression_speed.png` | Decompression GB/s per dataset |
+| `density.png` | Compression density per dataset (values per 1024 bits, higher is better) |
+| `*_zstd_vs_alp.png` | The same three charts without PLAIN |
+| `avg_*.png` | Averages over all datasets, one bar per encoding, with a broken y-axis when one bar dwarfs the rest |
 
 
 
