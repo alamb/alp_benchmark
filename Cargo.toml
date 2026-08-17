@@ -1,0 +1,16 @@
+[package]
+name = "alp_benchmark"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# parquet / arrow pinned to the head of the ALP encoding PR
+# (https://github.com/apache/arrow-rs/pull/9372), which implements the
+# experimental ALP encoder and decoder for
+# https://github.com/apache/arrow-rs/issues/10541
+[dependencies]
+parquet = { git = "https://github.com/apache/arrow-rs.git", rev = "f9794b4f4ac9fa896ed507b6d7c6e7556db041a9", features = ["arrow", "zstd", "experimental"] }
+arrow-array = { git = "https://github.com/apache/arrow-rs.git", rev = "f9794b4f4ac9fa896ed507b6d7c6e7556db041a9" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs.git", rev = "f9794b4f4ac9fa896ed507b6d7c6e7556db041a9" }
+bytes = "1"
