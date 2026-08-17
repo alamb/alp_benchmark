@@ -50,6 +50,7 @@ This creates in `diagrams/<report name>/`:
 | `density.png` | Compression density per dataset (values per 1024 bits, higher is better) |
 | `*_zstd_vs_alp.png` | The same three charts without PLAIN |
 | `avg_*.png` | Averages over all datasets, one bar per encoding, with a broken y-axis when one bar dwarfs the rest |
+| `random_access.png` | Random access speed (rows decoded per second, higher is better), one bar per encoding |
 
 
 

@@ -17,6 +17,9 @@ produced by benchmark.sh and renders:
   per dataset (ZSTD vs ALP):     compression_speed_zstd_vs_alp.png, ...
   averages over all datasets:    avg_compression_speed.png, avg_decompression_speed.png, avg_density.png
 
+If the report has a "Random access" table, also renders random_access.png
+(rows decoded per second, one bar per encoding).
+
 Compressed size is plotted as density = 1024 / (bits/value), so higher is
 better on every chart. Average charts get a broken y-axis when the tallest
 bar dwarfs the runner-up (>3x); the per-dataset density charts cap the y-axis
@@ -32,6 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from matplotlib.patches import Patch
+from matplotlib.ticker import EngFormatter
 
 CHOICES = ["PLAIN", "PLAIN + ZSTD", "ALP"]
 COLORS = {"PLAIN": "#2a78d6", "PLAIN + ZSTD": "#eb6834", "ALP": "#1baf7a"}
@@ -40,6 +44,7 @@ AVG_KEY = "ALL AVG."
 DENSITY_CAP = 150  # per-dataset density cap; gov26/31/40 reach ~5000
 SPEED_Y = "GB/s (higher is better)"
 DENSITY_Y = "values per 1024 bits (higher is better)"
+ROWS_Y = "rows per second (higher is better)"
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -85,6 +90,38 @@ def parse_report(path: Path):
     return cpu, datasets, table
 
 
+def parse_random_access(path: Path):
+    """Return (n_rows, dataset, {choice: rows per second}) from the
+    "Random access" table, or None if the report has no such table."""
+    text = path.read_text()
+    if "## Random access" not in text:
+        return None
+    section = text.split("## Random access", 1)[-1]
+
+    m = re.search(r"\|\s*(\d+)\s+random rows\s*\(µs\)\s*\|", section)
+    n_rows = int(m.group(1)) if m else 100
+    m = re.search(r"rows from\s*`([^`]+)`", section)
+    dataset = m.group(1) if m else ""
+
+    rows_per_sec = {}
+    for line in section.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 2 and cells[0] in CHOICES:
+            rows_per_sec[cells[0]] = n_rows / (float(cells[1]) * 1e-6)
+    if set(rows_per_sec) != set(CHOICES):
+        print(f"warning: skipping random access chart, incomplete table in {path}", file=sys.stderr)
+        return None
+    return n_rows, dataset, rows_per_sec
+
+
+def human(v):
+    if v >= 1e6:
+        return f"{v / 1e6:,.1f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:,.1f}K"
+    return f"{v:,.1f}"
+
+
 def style_axis(ax):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -95,13 +132,17 @@ def style_axis(ax):
 
 
 def add_titles(fig, title, subtitle):
+    # wrap long subtitles (e.g. long CPU names) at a separator on narrow figures
+    if len(subtitle) > 8 * fig.get_figwidth() and " · " in subtitle:
+        head, _, tail = subtitle.rpartition(" · ")
+        subtitle = f"{head}\n{tail}"
     fig.text(0.02, 0.97, title, ha="left", va="top", fontsize=13, fontweight="bold")
-    fig.text(0.02, 0.925, subtitle, ha="left", va="top", fontsize=9.5, color=MUTED)
+    fig.text(0.02, 0.925, subtitle, ha="left", va="top", fontsize=9.5, color=MUTED, linespacing=1.4)
 
 
-def label_bar(ax, x, v, lo, hi):
+def label_bar(ax, x, v, lo, hi, fmt=lambda v: f"{v:,.1f}"):
     if lo <= v <= hi:
-        ax.annotate(f"{v:,.1f}", (x, v), xytext=(0, 4), textcoords="offset points",
+        ax.annotate(fmt(v), (x, v), xytext=(0, 4), textcoords="offset points",
                     ha="center", va="bottom", fontsize=11, fontweight="bold", color=INK)
 
 
@@ -128,23 +169,25 @@ def per_dataset_chart(path, datasets, table, metric, choices, title, subtitle, y
     plt.close(fig)
 
 
-def avg_plain_chart(path, vals, y_label, title, subtitle):
+def avg_plain_chart(path, vals, y_label, title, subtitle, fmt=lambda v: f"{v:,.1f}", y_fmt=None):
     fig, ax = plt.subplots(figsize=(5.4, 4.2), dpi=200)
     ax.bar(range(len(vals)), vals, width=0.55, color=[COLORS[c] for c in CHOICES], zorder=3)
     style_axis(ax)
     top = max(vals) * 1.18
     ax.set_ylim(0, top)
+    if y_fmt is not None:
+        ax.yaxis.set_major_formatter(y_fmt)
     for x, v in enumerate(vals):
-        label_bar(ax, x, v, 0, top)
+        label_bar(ax, x, v, 0, top, fmt)
     ax.set_xticks(range(len(vals)), CHOICES, fontsize=11)
     ax.set_ylabel(y_label, fontsize=10)
     add_titles(fig, title, subtitle)
-    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     fig.savefig(path, facecolor="white")
     plt.close(fig)
 
 
-def avg_broken_chart(path, vals, y_label, title, subtitle):
+def avg_broken_chart(path, vals, y_label, title, subtitle, fmt=lambda v: f"{v:,.1f}", y_fmt=None):
     """Two panels sharing x: top shows only the outlier's range, bottom the rest."""
     second = sorted(vals)[-2]
     outlier = max(vals)
@@ -157,6 +200,8 @@ def avg_broken_chart(path, vals, y_label, title, subtitle):
     for ax in (ax_t, ax_b):
         ax.bar(range(len(vals)), vals, width=0.55, color=[COLORS[c] for c in CHOICES], zorder=3)
         style_axis(ax)
+        if y_fmt is not None:
+            ax.yaxis.set_major_formatter(y_fmt)
     ax_t.set_ylim(outlier * 0.93, outlier * 1.12)
     ax_b.set_ylim(0, second * 1.35)
 
@@ -171,13 +216,13 @@ def avg_broken_chart(path, vals, y_label, title, subtitle):
     ax_b.plot([0], [1], transform=ax_b.transAxes, **kw)
 
     for x, v in enumerate(vals):
-        label_bar(ax_b, x, v, 0, second * 1.35)
-        label_bar(ax_t, x, v, outlier * 0.93, outlier * 1.12)
+        label_bar(ax_b, x, v, 0, second * 1.35, fmt)
+        label_bar(ax_t, x, v, outlier * 0.93, outlier * 1.12, fmt)
 
     ax_b.set_xticks(range(len(vals)), CHOICES, fontsize=11)
     fig.supylabel(y_label, fontsize=10, x=0.02)
     add_titles(fig, title, subtitle)
-    gs.tight_layout(fig, rect=(0.03, 0, 1, 0.88))
+    gs.tight_layout(fig, rect=(0.03, 0, 1, 0.86))
     fig.savefig(path, facecolor="white")
     plt.close(fig)
 
@@ -213,6 +258,19 @@ def main():
             avg_broken_chart(avg_path, vals, y_label, avg_title, avg_subtitle)
         else:
             avg_plain_chart(avg_path, vals, y_label, avg_title, avg_subtitle)
+
+    random_access = parse_random_access(report)
+    if random_access is not None:
+        n_rows, dataset, rows_per_sec = random_access
+        vals = [rows_per_sec[c] for c in CHOICES]
+        ra_subtitle = f"Decoding {n_rows} random rows" + (f" from {dataset}" if dataset else "")
+        ra_subtitle += f" · {cpu}" if cpu else ""
+        kwargs = dict(fmt=human, y_fmt=EngFormatter(places=0, sep=""))
+        ra_path = out / "random_access.png"
+        if max(vals) > 3 * sorted(vals)[-2]:
+            avg_broken_chart(ra_path, vals, ROWS_Y, "Random access speed", ra_subtitle, **kwargs)
+        else:
+            avg_plain_chart(ra_path, vals, ROWS_Y, "Random access speed", ra_subtitle, **kwargs)
 
     for p in sorted(out.iterdir()):
         print(p)
