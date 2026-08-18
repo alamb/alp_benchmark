@@ -48,6 +48,21 @@ This will print a textual report. Example reports:
 * [kosta](reports/kosta.md)
 * [alamb](reports/alamb.md)
 
+## Run on your own Parquet files
+
+The benchmark binary also accepts Parquet files, so you can measure ALP on
+your own datasets. Point it at a directory or a single  file:
+
+```shell
+cargo run --release --bin benchmark -- /path/to/parquet-files
+```
+
+Every top-level `FLOAT` or `DOUBLE` column becomes its own dataset named
+`<file>/<column>` and runs the same comparisons as the `.bin` corpus
+
+For the most representative speed numbers, build with
+`RUSTFLAGS="-C target-cpu=native"` (as `benchmark.sh` does).
+
 ## Diagrams
 There is a python script that post-processes the benchmark results and generates diagrams.
 It requires [uv](https://docs.astral.sh/uv/), which fetches the dependencies

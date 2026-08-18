@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compares the on-disk size of three Parquet choices for columns of doubles:
-//! `PLAIN`, `PLAIN + ZSTD`, and `ALP` without a block compressor.
+//! Compares the on-disk size of three Parquet choices for floating-point
+//! columns: `PLAIN`, `PLAIN + ZSTD`, and `ALP` without a block compressor.
 //!
 //! Ported from the ALP compression statistics example in
 //! <https://github.com/apache/arrow-rs/pull/10696>.
@@ -37,10 +37,19 @@
 //! inputs occupy roughly 22 GiB.
 //!
 //! These CWI files are raw little-endian IEEE-754 `f64` values. The remaining
-//! archive entries are `f32` datasets or a dummy fixture and are outside this
-//! double-only benchmark. A directory of one-double-per-line CSV files, such as
-//! `CWI/ALP/data/samples`, also works. Directories are searched recursively for
-//! `.bin` and `.csv` files.
+//! archive entries are `f32` datasets or a dummy fixture and are outside the
+//! raw-binary path of this benchmark. A directory of one-double-per-line CSV
+//! files, such as `CWI/ALP/data/samples`, also works. Directories are searched
+//! recursively for `.bin`, `.csv`, and `.parquet` files.
+//!
+//! # Bring your own Parquet data
+//!
+//! To try the benchmark on your own datasets, pass a Parquet file or a
+//! directory containing Parquet files. Every top-level `FLOAT` or `DOUBLE`
+//! column becomes its own dataset named `<file>/<column>` and runs the same
+//! size, speed, and random-access comparisons as the `.bin` corpus. Other
+//! column types are skipped and null values are dropped. `FLOAT` columns are
+//! measured natively: four uncompressed bytes per value instead of eight.
 //!
 //! # What is measured
 //!
@@ -51,17 +60,18 @@
 //! directly comparable without retaining a potentially multi-gigabyte Parquet
 //! file in memory.
 //!
-//! Speed processes every value in every dataset in 131,072-value (1 MiB) pages.
+//! Speed processes every value in every dataset in 131,072-value pages.
 //! Short pages are repeated to stabilize the elapsed-time measurement and
 //! normalized back to one page before being added to the dataset total. The
-//! reported GB/s uses the uncompressed input size (eight bytes per value). The
-//! companion script builds with `-C target-cpu=native` unless `RUSTFLAGS` is
-//! already set.
+//! reported GB/s uses the uncompressed input size (eight bytes per `f64`
+//! value, four per `f32`). The companion script builds with
+//! `-C target-cpu=native` unless `RUSTFLAGS` is already set.
 //!
 //! A focused random-access comparison performs 100 deterministic point lookups
-//! on `city_temperature_f`. Each lookup starts from an in-memory encoded page;
-//! PLAIN + ZSTD must decompress the complete page, while ALP can skip directly
-//! to the vector containing the selected row.
+//! on `city_temperature_f` and on every Parquet-sourced column. Each lookup
+//! starts from an in-memory encoded page; PLAIN + ZSTD must decompress the
+//! complete page, while ALP can skip directly to the vector containing the
+//! selected row.
 
 use std::fs::File;
 use std::hint::black_box;
@@ -70,15 +80,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{Float64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Type as PhysicalType;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::compression::create_codec;
-use parquet::data_type::DoubleType;
+use parquet::data_type::{DataType as ParquetDataType, DoubleType, FloatType};
 use parquet::decoding::{Decoder, get_decoder};
-use parquet::encoding::get_encoder;
+use parquet::encoding::{Encoder, get_encoder};
 use parquet::errors::{ParquetError, Result};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor, ColumnPath, Type};
@@ -90,6 +101,111 @@ const SPEED_PAGE_VALUES: usize = 128 * 1024;
 const RANDOM_ACCESS_DATASET: &str = "city_temperature_f";
 const RANDOM_ACCESS_ROWS: usize = 100;
 const RANDOM_ACCESS_TARGET_SECONDS: f64 = 0.05;
+const RANDOM_ACCESS_NOTE: &str = "\nPLAIN and ALP reset the page decoder, skip to the selected row, and decode one value. PLAIN + ZSTD additionally decompresses the complete target page for every independent lookup. Encoded pages are already in memory; file I/O and page lookup are excluded.";
+
+/// A floating-point value type measured by this benchmark: `f64` for `.bin`,
+/// `.csv`, and Parquet `DOUBLE` columns; `f32` for Parquet `FLOAT` columns.
+trait AlpFloat: Copy + Default + 'static {
+    type Parquet: ParquetDataType<T = Self>;
+    const ARROW_TYPE: DataType;
+    const PHYSICAL: PhysicalType;
+    fn bits(self) -> u64;
+    fn from_f64(value: f64) -> Self;
+    fn into_array(values: Vec<Self>) -> ArrayRef;
+    /// The non-null values of a projected single-column record batch.
+    fn batch_values(array: &dyn Array) -> Result<Vec<Self>>;
+}
+
+impl AlpFloat for f64 {
+    type Parquet = DoubleType;
+    const ARROW_TYPE: DataType = DataType::Float64;
+    const PHYSICAL: PhysicalType = PhysicalType::DOUBLE;
+
+    fn bits(self) -> u64 {
+        self.to_bits()
+    }
+
+    fn from_f64(value: f64) -> Self {
+        value
+    }
+
+    fn into_array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(Float64Array::from(values))
+    }
+
+    fn batch_values(array: &dyn Array) -> Result<Vec<Self>> {
+        let array = array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| ParquetError::General("expected a Float64 column".into()))?;
+        Ok(if array.null_count() == 0 {
+            array.values().to_vec()
+        } else {
+            array.iter().flatten().collect()
+        })
+    }
+}
+
+impl AlpFloat for f32 {
+    type Parquet = FloatType;
+    const ARROW_TYPE: DataType = DataType::Float32;
+    const PHYSICAL: PhysicalType = PhysicalType::FLOAT;
+
+    fn bits(self) -> u64 {
+        self.to_bits() as u64
+    }
+
+    fn from_f64(value: f64) -> Self {
+        value as f32
+    }
+
+    fn into_array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(Float32Array::from(values))
+    }
+
+    fn batch_values(array: &dyn Array) -> Result<Vec<Self>> {
+        let array = array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| ParquetError::General("expected a Float32 column".into()))?;
+        Ok(if array.null_count() == 0 {
+            array.values().to_vec()
+        } else {
+            array.iter().flatten().collect()
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Precision {
+    F32,
+    F64,
+}
+
+enum Source {
+    /// A `.bin` or `.csv` file of raw `f64` values.
+    Raw(PathBuf),
+    /// One top-level `FLOAT` or `DOUBLE` column of a Parquet file, identified
+    /// by its root schema index.
+    Parquet { path: PathBuf, root: usize },
+}
+
+/// One benchmarked column of values: a whole `.bin`/`.csv` file, or a single
+/// floating-point column of a Parquet file.
+struct Dataset {
+    name: String,
+    source: Source,
+    precision: Precision,
+}
+
+impl Dataset {
+    /// Random access runs on every Parquet column so bring-your-own datasets
+    /// get the complete comparison, and on the corpus dataset the report
+    /// highlights.
+    fn wants_random_access(&self) -> bool {
+        matches!(self.source, Source::Parquet { .. }) || self.name == RANDOM_ACCESS_DATASET
+    }
+}
 
 struct Row {
     name: String,
@@ -132,28 +248,28 @@ struct RandomAccessPage {
     alp: bytes::Bytes,
 }
 
-struct RandomAccessQuery {
+struct RandomAccessQuery<T> {
     page: usize,
     offset: usize,
-    expected: f64,
+    expected: T,
 }
 
 #[derive(Default)]
 struct TimingTotals {
-    values: usize,
+    bytes: usize,
     compression: f64,
     decompression: f64,
 }
 
 impl TimingTotals {
-    fn add(&mut self, values: usize, compression: f64, decompression: f64) {
-        self.values += values;
+    fn add(&mut self, bytes: usize, compression: f64, decompression: f64) {
+        self.bytes += bytes;
         self.compression += compression;
         self.decompression += decompression;
     }
 
     fn speed(&self) -> Speed {
-        let input_gb = self.values as f64 * std::mem::size_of::<f64>() as f64 / 1_000_000_000.0;
+        let input_gb = self.bytes as f64 / 1_000_000_000.0;
         Speed {
             compression: input_gb / self.compression,
             decompression: input_gb / self.decompression,
@@ -167,45 +283,80 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             eprintln!(
-                "usage: benchmark <CWI complete_binaries directory or dataset file>\n\n\
+                "usage: benchmark <dataset directory or file>\n\n\
+             Accepts .bin files of raw little-endian f64 values, .csv files\n\
+             with one double per line, and .parquet files. Every top-level\n\
+             FLOAT or DOUBLE column of a Parquet file is benchmarked as its\n\
+             own dataset.\n\n\
              Download complete_binaries.zip as described in:\n  \
              https://github.com/cwida/ALP/blob/main/BENCHMARKING.md"
             );
             std::process::exit(2);
         });
 
-    let mut paths = Vec::new();
-    collect_datasets(&input, &mut paths)
+    let mut files = Vec::new();
+    collect_files(&input, &mut files)
         .unwrap_or_else(|e| panic!("cannot discover datasets in {}: {e}", input.display()));
-    paths.sort();
+    files.sort();
     assert!(
-        !paths.is_empty(),
-        "no .bin or .csv files in {}",
+        !files.is_empty(),
+        "no .bin, .csv, or .parquet files in {}",
         input.display()
     );
 
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Float64,
-        false,
-    )]));
-    let mut rows = Vec::with_capacity(paths.len());
-    for (idx, path) in paths.iter().enumerate() {
-        eprintln!("[{}/{}] measuring {}", idx + 1, paths.len(), path.display());
-        rows.push(measure(path, &schema)?);
-    }
+    let datasets = expand_datasets(&files);
+    assert!(
+        !datasets.is_empty(),
+        "no benchmarkable datasets in {}",
+        input.display()
+    );
 
-    let speed_rows = measure_speed(&paths)?;
-    let random_access = measure_random_access(&paths, &rows)?;
-    print_table(&rows, &speed_rows);
-    if let Some(random_access) = random_access {
-        print_random_access_table(&random_access);
+    let mut rows = Vec::with_capacity(datasets.len());
+    let mut speed_rows = Vec::with_capacity(datasets.len());
+    let mut random_rows = Vec::new();
+    for (idx, dataset) in datasets.iter().enumerate() {
+        eprintln!("[{}/{}] measuring {}", idx + 1, datasets.len(), dataset.name);
+        let result = match dataset.precision {
+            Precision::F64 => run_dataset::<f64>(dataset),
+            Precision::F32 => run_dataset::<f32>(dataset),
+        };
+        match result {
+            Ok((row, speed, random)) => {
+                rows.push(row);
+                speed_rows.push(speed);
+                random_rows.extend(random);
+            }
+            Err(e) => eprintln!("skipping {}: {e}", dataset.name),
+        }
     }
+    assert!(!rows.is_empty(), "every dataset failed to benchmark");
+
+    print_table(&rows, &speed_rows);
+    print_random_access_tables(&random_rows);
     print_summary(&rows, &speed_rows);
     Ok(())
 }
 
-fn collect_datasets(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// Runs the size, speed, and (where applicable) random-access comparisons on
+/// one dataset of `T` values.
+fn run_dataset<T: AlpFloat>(dataset: &Dataset) -> Result<(Row, SpeedRow, Option<RandomAccessRow>)> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        T::ARROW_TYPE,
+        false,
+    )]));
+    let row = measure::<T>(dataset, &schema)?;
+    let speed = benchmark_dataset::<T>(dataset)?;
+    let random = if dataset.wants_random_access() {
+        eprintln!("    random access on {}", dataset.name);
+        Some(benchmark_random_access::<T>(dataset, row.num_values)?)
+    } else {
+        None
+    };
+    Ok((row, speed, random))
+}
+
+fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if path.is_file() {
         if is_dataset(path) {
             out.push(path.to_owned());
@@ -216,7 +367,7 @@ fn collect_datasets(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
     for entry in std::fs::read_dir(path)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_datasets(&path, out)?;
+            collect_files(&path, out)?;
         } else if is_dataset(&path) {
             out.push(path);
         }
@@ -225,30 +376,84 @@ fn collect_datasets(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
 }
 
 fn is_dataset(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin") || ext.eq_ignore_ascii_case("csv"))
+    has_extension(path, "bin") || has_extension(path, "csv") || has_extension(path, "parquet")
 }
 
-fn measure(path: &Path, schema: &SchemaRef) -> Result<Row> {
-    let plain = write(path, schema, Encoding::PLAIN, Compression::UNCOMPRESSED)?;
-    let plain_zstd = write(
-        path,
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+}
+
+/// Turns each `.bin`/`.csv` file into one dataset and each Parquet file into
+/// one dataset per top-level floating-point column. Unreadable Parquet files
+/// are skipped with a warning so one bad file does not abort the run.
+fn expand_datasets(files: &[PathBuf]) -> Vec<Dataset> {
+    let mut datasets = Vec::new();
+    for path in files {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if has_extension(path, "parquet") {
+            if let Err(e) = parquet_columns(path, &name, &mut datasets) {
+                eprintln!("skipping {}: {e}", path.display());
+            }
+        } else {
+            datasets.push(Dataset {
+                name,
+                source: Source::Raw(path.clone()),
+                precision: Precision::F64,
+            });
+        }
+    }
+    datasets
+}
+
+fn parquet_columns(path: &Path, stem: &str, out: &mut Vec<Dataset>) -> Result<()> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let mut found = false;
+    for (root, field) in builder.schema().fields().iter().enumerate() {
+        let precision = match field.data_type() {
+            DataType::Float32 => Precision::F32,
+            DataType::Float64 => Precision::F64,
+            _ => continue,
+        };
+        found = true;
+        out.push(Dataset {
+            name: format!("{stem}/{}", field.name()),
+            source: Source::Parquet {
+                path: path.to_owned(),
+                root,
+            },
+            precision,
+        });
+    }
+    if !found {
+        eprintln!(
+            "skipping {}: no top-level FLOAT or DOUBLE columns",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn measure<T: AlpFloat>(dataset: &Dataset, schema: &SchemaRef) -> Result<Row> {
+    let plain = write::<T>(dataset, schema, Encoding::PLAIN, Compression::UNCOMPRESSED)?;
+    let plain_zstd = write::<T>(
+        dataset,
         schema,
         Encoding::PLAIN,
         Compression::ZSTD(ZstdLevel::default()),
     )?;
-    let alp = write(path, schema, Encoding::ALP, Compression::UNCOMPRESSED)?;
+    let alp = write::<T>(dataset, schema, Encoding::ALP, Compression::UNCOMPRESSED)?;
 
     if plain.num_values != plain_zstd.num_values || plain.num_values != alp.num_values {
         return Err(ParquetError::General(format!(
             "{} changed length between encodings",
-            path.display()
+            dataset.name
         )));
     }
 
     Ok(Row {
-        name: path.file_stem().unwrap().to_string_lossy().into_owned(),
+        name: dataset.name.clone(),
         num_values: plain.num_values,
         plain: plain.compressed_bytes,
         plain_zstd: plain_zstd.compressed_bytes,
@@ -256,8 +461,8 @@ fn measure(path: &Path, schema: &SchemaRef) -> Result<Row> {
     })
 }
 
-fn write(
-    path: &Path,
+fn write<T: AlpFloat>(
+    dataset: &Dataset,
     schema: &SchemaRef,
     encoding: Encoding,
     compression: Compression,
@@ -269,16 +474,15 @@ fn write(
         .build();
     let mut writer = ArrowWriter::try_new(sink(), schema.clone(), Some(props))?;
 
-    let num_values = for_each_batch(path, |values| {
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))])?;
+    let num_values = for_each_batch::<T>(dataset, |values| {
+        let batch = RecordBatch::try_new(schema.clone(), vec![T::into_array(values)])?;
         writer.write(&batch)
     })?;
     let metadata = writer.close()?;
     if num_values == 0 {
         return Err(ParquetError::General(format!(
             "{} contains no values",
-            path.display()
+            dataset.name
         )));
     }
     let compressed_bytes = metadata
@@ -287,10 +491,10 @@ fn write(
         .map(|row_group| row_group.column(0).compressed_size())
         .try_fold(0u64, |total, bytes| {
             let bytes = u64::try_from(bytes).map_err(|_| {
-                ParquetError::General(format!("negative column size for {}", path.display()))
+                ParquetError::General(format!("negative column size for {}", dataset.name))
             })?;
             total.checked_add(bytes).ok_or_else(|| {
-                ParquetError::General(format!("column size overflow for {}", path.display()))
+                ParquetError::General(format!("column size overflow for {}", dataset.name))
             })
         })?;
 
@@ -300,18 +504,27 @@ fn write(
     })
 }
 
-fn for_each_batch(path: &Path, consume: impl FnMut(Vec<f64>) -> Result<()>) -> Result<usize> {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("bin") => read_binary(path, consume),
-        Some(ext) if ext.eq_ignore_ascii_case("csv") => read_csv(path, consume),
-        _ => Err(ParquetError::General(format!(
-            "unsupported dataset file {}",
-            path.display()
-        ))),
+fn for_each_batch<T: AlpFloat>(
+    dataset: &Dataset,
+    consume: impl FnMut(Vec<T>) -> Result<()>,
+) -> Result<usize> {
+    match &dataset.source {
+        Source::Raw(path) => match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("bin") => read_binary(path, consume),
+            Some(ext) if ext.eq_ignore_ascii_case("csv") => read_csv(path, consume),
+            _ => Err(ParquetError::General(format!(
+                "unsupported dataset file {}",
+                path.display()
+            ))),
+        },
+        Source::Parquet { path, root } => read_parquet_column(path, *root, consume),
     }
 }
 
-fn read_binary(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> Result<usize> {
+fn read_binary<T: AlpFloat>(
+    path: &Path,
+    mut consume: impl FnMut(Vec<T>) -> Result<()>,
+) -> Result<usize> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut bytes = vec![0u8; INPUT_BATCH_VALUES * std::mem::size_of::<f64>()];
     let mut total = 0usize;
@@ -336,9 +549,9 @@ fn read_binary(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> 
             )));
         }
 
-        let values: Vec<f64> = bytes[..filled]
+        let values: Vec<T> = bytes[..filled]
             .chunks_exact(std::mem::size_of::<f64>())
-            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .map(|chunk| T::from_f64(f64::from_le_bytes(chunk.try_into().unwrap())))
             .collect();
         total += values.len();
         consume(values)?;
@@ -350,7 +563,10 @@ fn read_binary(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> 
     Ok(total)
 }
 
-fn read_csv(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> Result<usize> {
+fn read_csv<T: AlpFloat>(
+    path: &Path,
+    mut consume: impl FnMut(Vec<T>) -> Result<()>,
+) -> Result<usize> {
     let reader = BufReader::new(File::open(path)?);
     let mut values = Vec::with_capacity(INPUT_BATCH_VALUES);
     let mut total = 0usize;
@@ -368,7 +584,7 @@ fn read_csv(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> Res
                 idx + 1
             ))
         })?;
-        values.push(value);
+        values.push(T::from_f64(value));
         if values.len() == INPUT_BATCH_VALUES {
             total += values.len();
             consume(std::mem::take(&mut values))?;
@@ -377,6 +593,26 @@ fn read_csv(path: &Path, mut consume: impl FnMut(Vec<f64>) -> Result<()>) -> Res
     }
 
     if !values.is_empty() {
+        total += values.len();
+        consume(values)?;
+    }
+    Ok(total)
+}
+
+fn read_parquet_column<T: AlpFloat>(
+    path: &Path,
+    root: usize,
+    mut consume: impl FnMut(Vec<T>) -> Result<()>,
+) -> Result<usize> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
+        .with_batch_size(INPUT_BATCH_VALUES);
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [root]);
+    let mut total = 0usize;
+    for batch in builder.with_projection(mask).build()? {
+        let values = T::batch_values(batch?.column(0).as_ref())?;
+        if values.is_empty() {
+            continue;
+        }
         total += values.len();
         consume(values)?;
     }
@@ -441,7 +677,15 @@ fn print_average_row(choice: &str, speed: Speed, bits: f64) {
     );
 }
 
-fn print_random_access_table(row: &RandomAccessRow) {
+fn print_random_access_tables(rows: &[RandomAccessRow]) {
+    match rows {
+        [] => {}
+        [row] => print_single_random_access_table(row),
+        rows => print_multi_random_access_table(rows),
+    }
+}
+
+fn print_single_random_access_table(row: &RandomAccessRow) {
     println!("\n## Random access\n");
     println!(
         "Time to decode {RANDOM_ACCESS_ROWS} deterministic, uniformly distributed rows from `{}` (lower is better). Each lookup starts from the encoded page.\n",
@@ -452,9 +696,23 @@ fn print_random_access_table(row: &RandomAccessRow) {
     println!("| PLAIN | {:.3} |", row.plain_us);
     println!("| PLAIN + ZSTD | {:.3} |", row.plain_zstd_us);
     println!("| ALP | {:.3} |", row.alp_us);
+    println!("{RANDOM_ACCESS_NOTE}");
+}
+
+fn print_multi_random_access_table(rows: &[RandomAccessRow]) {
+    println!("\n## Random access\n");
     println!(
-        "\nPLAIN and ALP reset the page decoder, skip to the selected row, and decode one value. PLAIN + ZSTD additionally decompresses the complete target page for every independent lookup. Encoded pages are already in memory; file I/O and page lookup are excluded."
+        "Time to decode {RANDOM_ACCESS_ROWS} deterministic, uniformly distributed rows from each dataset (lower is better). Each lookup starts from the encoded page.\n"
     );
+    println!("| Dataset | PLAIN (µs) | PLAIN + ZSTD (µs) | ALP (µs) |");
+    println!("|---|---:|---:|---:|");
+    for row in rows {
+        println!(
+            "| {} | {:.3} | {:.3} | {:.3} |",
+            row.name, row.plain_us, row.plain_zstd_us, row.alp_us
+        );
+    }
+    println!("{RANDOM_ACCESS_NOTE}");
 }
 
 fn print_summary(rows: &[Row], speed_rows: &[SpeedRow]) {
@@ -541,46 +799,23 @@ fn speed_arithmetic_means(rows: &[SpeedRow]) -> (Speed, Speed, Speed) {
     )
 }
 
-fn measure_speed(paths: &[PathBuf]) -> Result<Vec<SpeedRow>> {
-    let descriptor = double_column_descriptor()?;
-    let mut rows = Vec::with_capacity(paths.len());
-
-    eprintln!("Measuring full-dataset page speed");
-    for (idx, path) in paths.iter().enumerate() {
-        eprintln!("[{}/{}] timing {}", idx + 1, paths.len(), path.display());
-        rows.push(benchmark_dataset(path, &descriptor)?);
-    }
-
-    Ok(rows)
-}
-
-fn measure_random_access(paths: &[PathBuf], rows: &[Row]) -> Result<Option<RandomAccessRow>> {
-    let Some((path, row)) = paths
-        .iter()
-        .zip(rows)
-        .find(|(_, row)| row.name == RANDOM_ACCESS_DATASET)
-    else {
-        return Ok(None);
-    };
-
-    eprintln!("Measuring random access on {}", path.display());
-    benchmark_random_access(path, row.num_values).map(Some)
-}
-
-fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAccessRow> {
-    let descriptor = double_column_descriptor()?;
+fn benchmark_random_access<T: AlpFloat>(
+    dataset: &Dataset,
+    num_values: usize,
+) -> Result<RandomAccessRow> {
+    let descriptor = column_descriptor::<T>()?;
     let indices = random_row_indices(num_values);
-    let mut expected = vec![None; indices.len()];
+    let mut expected: Vec<Option<T>> = vec![None; indices.len()];
     let mut pages = Vec::new();
     let mut page_start = 0usize;
 
-    let mut plain_encoder = get_encoder::<DoubleType>(Encoding::PLAIN, &descriptor)?;
-    let mut alp_encoder = get_encoder::<DoubleType>(Encoding::ALP, &descriptor)?;
+    let mut plain_encoder = get_encoder::<T::Parquet>(Encoding::PLAIN, &descriptor)?;
+    let mut alp_encoder = get_encoder::<T::Parquet>(Encoding::ALP, &descriptor)?;
     let mut codec = create_codec(Compression::ZSTD(ZstdLevel::default()), &Default::default())?
         .expect("ZSTD is a compressed codec");
     let mut alp_preset_ready = false;
 
-    let read_values = for_each_batch(path, |values| {
+    let read_values = for_each_batch::<T>(dataset, |values| {
         if !alp_preset_ready {
             alp_encoder.put(&values)?;
             black_box(alp_encoder.flush_buffer()?);
@@ -620,7 +855,7 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
     if read_values != num_values {
         return Err(ParquetError::General(format!(
             "{} changed length between size and random-access passes",
-            path.display()
+            dataset.name
         )));
     }
 
@@ -640,14 +875,14 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
         })
         .collect::<Vec<_>>();
 
-    let mut plain_decoder: Box<dyn Decoder<DoubleType>> =
+    let mut plain_decoder: Box<dyn Decoder<T::Parquet>> =
         get_decoder(descriptor.clone(), Encoding::PLAIN)?;
     decode_random_rows(&mut plain_decoder, &pages, &queries, Encoding::PLAIN, true)?;
     let plain_us = measure_operation(|| {
         decode_random_rows(&mut plain_decoder, &pages, &queries, Encoding::PLAIN, false)
     })?;
 
-    let mut alp_decoder: Box<dyn Decoder<DoubleType>> = get_decoder(descriptor, Encoding::ALP)?;
+    let mut alp_decoder: Box<dyn Decoder<T::Parquet>> = get_decoder(descriptor, Encoding::ALP)?;
     decode_random_rows(&mut alp_decoder, &pages, &queries, Encoding::ALP, true)?;
     let alp_us = measure_operation(|| {
         decode_random_rows(&mut alp_decoder, &pages, &queries, Encoding::ALP, false)
@@ -660,7 +895,7 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
     })?;
 
     Ok(RandomAccessRow {
-        name: RANDOM_ACCESS_DATASET.into(),
+        name: dataset.name.clone(),
         plain_us,
         plain_zstd_us: zstd_us + plain_us,
         alp_us,
@@ -681,14 +916,14 @@ fn random_row_indices(num_values: usize) -> Vec<usize> {
         .collect()
 }
 
-fn decode_random_rows(
-    decoder: &mut Box<dyn Decoder<DoubleType>>,
+fn decode_random_rows<T: AlpFloat>(
+    decoder: &mut Box<dyn Decoder<T::Parquet>>,
     pages: &[RandomAccessPage],
-    queries: &[RandomAccessQuery],
+    queries: &[RandomAccessQuery<T>],
     encoding: Encoding,
     validate: bool,
 ) -> Result<()> {
-    let mut decoded = [0.0];
+    let mut decoded = [T::default()];
     for query in queries {
         let page = &pages[query.page];
         let data = match encoding {
@@ -704,7 +939,7 @@ fn decode_random_rows(
                 "{encoding} random lookup skipped {skipped} and read {read} values"
             )));
         }
-        if validate && decoded[0].to_bits() != query.expected.to_bits() {
+        if validate && decoded[0].bits() != query.expected.bits() {
             return Err(ParquetError::General(format!(
                 "{encoding} random lookup did not reproduce row {}",
                 page.start + query.offset
@@ -715,10 +950,10 @@ fn decode_random_rows(
     Ok(())
 }
 
-fn decompress_random_pages(
+fn decompress_random_pages<T: AlpFloat>(
     codec: &mut Box<dyn parquet::compression::Codec>,
     pages: &[RandomAccessPage],
-    queries: &[RandomAccessQuery],
+    queries: &[RandomAccessQuery<T>],
     decompressed: &mut Vec<u8>,
     validate: bool,
 ) -> Result<()> {
@@ -741,7 +976,7 @@ fn decompress_random_pages(
                 "ZSTD random lookup did not reproduce the PLAIN page".into(),
             ));
         }
-        black_box(decompressed[query.offset * std::mem::size_of::<f64>()]);
+        black_box(decompressed[query.offset * std::mem::size_of::<T>()]);
     }
     Ok(())
 }
@@ -766,8 +1001,8 @@ fn measure_operation(mut operation: impl FnMut() -> Result<()>) -> Result<f64> {
     Ok(start.elapsed().as_secs_f64() * 1_000_000.0 / repetitions as f64)
 }
 
-fn double_column_descriptor() -> Result<ColumnDescPtr> {
-    let primitive = Type::primitive_type_builder("value", PhysicalType::DOUBLE).build()?;
+fn column_descriptor<T: AlpFloat>() -> Result<ColumnDescPtr> {
+    let primitive = Type::primitive_type_builder("value", T::PHYSICAL).build()?;
     Ok(Arc::new(ColumnDescriptor::new(
         Arc::new(primitive),
         0,
@@ -776,12 +1011,13 @@ fn double_column_descriptor() -> Result<ColumnDescPtr> {
     )))
 }
 
-fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow> {
-    let mut plain_encoder = get_encoder::<DoubleType>(Encoding::PLAIN, descriptor)?;
-    let mut plain_decoder: Box<dyn Decoder<DoubleType>> =
+fn benchmark_dataset<T: AlpFloat>(dataset: &Dataset) -> Result<SpeedRow> {
+    let descriptor = column_descriptor::<T>()?;
+    let mut plain_encoder = get_encoder::<T::Parquet>(Encoding::PLAIN, &descriptor)?;
+    let mut plain_decoder: Box<dyn Decoder<T::Parquet>> =
         get_decoder(descriptor.clone(), Encoding::PLAIN)?;
-    let mut alp_encoder = get_encoder::<DoubleType>(Encoding::ALP, descriptor)?;
-    let mut alp_decoder: Box<dyn Decoder<DoubleType>> =
+    let mut alp_encoder = get_encoder::<T::Parquet>(Encoding::ALP, &descriptor)?;
+    let mut alp_decoder: Box<dyn Decoder<T::Parquet>> =
         get_decoder(descriptor.clone(), Encoding::ALP)?;
     let mut codec = create_codec(Compression::ZSTD(ZstdLevel::default()), &Default::default())?
         .expect("ZSTD is a compressed codec");
@@ -790,7 +1026,7 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
     let mut alp_totals = TimingTotals::default();
     let mut alp_preset_ready = false;
 
-    let num_values = for_each_batch(path, |values| {
+    let num_values = for_each_batch::<T>(dataset, |values| {
         if !alp_preset_ready {
             // Build the row-group preset outside the timed region, matching the
             // paper's exclusion of first-level sampling from compression speed.
@@ -799,6 +1035,7 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             alp_preset_ready = true;
         }
 
+        let input_bytes = values.len() * std::mem::size_of::<T>();
         let repetitions = SPEED_PAGE_VALUES.div_ceil(values.len());
         let (plain_page, compression, decompression) = benchmark_encoded_page(
             &values,
@@ -807,12 +1044,12 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             Encoding::PLAIN,
             repetitions,
         )?;
-        plain_totals.add(values.len(), compression, decompression);
+        plain_totals.add(input_bytes, compression, decompression);
 
         let (zstd_compression, zstd_decompression) =
             benchmark_zstd_page(&plain_page, &mut codec, repetitions)?;
         zstd_totals.add(
-            values.len(),
+            input_bytes,
             compression + zstd_compression,
             zstd_decompression + decompression,
         );
@@ -824,29 +1061,29 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             Encoding::ALP,
             repetitions,
         )?;
-        alp_totals.add(values.len(), compression, decompression);
+        alp_totals.add(input_bytes, compression, decompression);
         Ok(())
     })?;
 
     if num_values == 0 {
         return Err(ParquetError::General(format!(
             "{} contains no values",
-            path.display()
+            dataset.name
         )));
     }
 
     Ok(SpeedRow {
-        name: path.file_stem().unwrap().to_string_lossy().into_owned(),
+        name: dataset.name.clone(),
         plain: plain_totals.speed(),
         plain_zstd: zstd_totals.speed(),
         alp: alp_totals.speed(),
     })
 }
 
-fn benchmark_encoded_page(
-    values: &[f64],
-    encoder: &mut Box<dyn parquet::encoding::Encoder<DoubleType>>,
-    decoder: &mut Box<dyn Decoder<DoubleType>>,
+fn benchmark_encoded_page<T: AlpFloat>(
+    values: &[T],
+    encoder: &mut Box<dyn Encoder<T::Parquet>>,
+    decoder: &mut Box<dyn Decoder<T::Parquet>>,
     encoding: Encoding,
     repetitions: usize,
 ) -> Result<(bytes::Bytes, f64, f64)> {
@@ -859,7 +1096,7 @@ fn benchmark_encoded_page(
     }
     let compression = elapsed_seconds(start, repetitions)?;
 
-    let mut decoded = vec![0.0; values.len()];
+    let mut decoded = vec![T::default(); values.len()];
     let start = Instant::now();
     for _ in 0..repetitions {
         decoder.set_data(page.clone(), values.len())?;
@@ -873,7 +1110,7 @@ fn benchmark_encoded_page(
         black_box(decoded[0]);
     }
     let decompression = elapsed_seconds(start, repetitions)?;
-    assert_f64_bits_eq(values, &decoded, encoding)?;
+    assert_bits_eq(values, &decoded, encoding)?;
 
     Ok((page, compression, decompression))
 }
@@ -929,11 +1166,11 @@ fn elapsed_seconds(start: Instant, repetitions: usize) -> Result<f64> {
     Ok(seconds)
 }
 
-fn assert_f64_bits_eq(expected: &[f64], actual: &[f64], encoding: Encoding) -> Result<()> {
+fn assert_bits_eq<T: AlpFloat>(expected: &[T], actual: &[T], encoding: Encoding) -> Result<()> {
     if expected
         .iter()
         .zip(actual)
-        .all(|(left, right)| left.to_bits() == right.to_bits())
+        .all(|(left, right)| left.bits() == right.bits())
     {
         return Ok(());
     }
