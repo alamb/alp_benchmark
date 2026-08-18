@@ -141,7 +141,7 @@ def add_titles(fig, title, subtitle):
         head, _, tail = subtitle.rpartition(" · ")
         subtitle = f"{head}\n{tail}"
     fig.text(0.02, 0.97, title, ha="left", va="top", fontsize=13, fontweight="bold")
-    fig.text(0.02, 0.925, subtitle, ha="left", va="top", fontsize=9.5, color=MUTED, linespacing=1.4)
+    fig.text(0.02, 0.912, subtitle, ha="left", va="top", fontsize=9.5, color=MUTED, linespacing=1.4)
 
 
 def label_bar(ax, x, v, lo, hi, fmt=lambda v: f"{v:,.1f}", fontsize=11):
@@ -207,7 +207,7 @@ def pick_outlier(vals):
 def grouped_avg_chart(path, labels, vals, y_label, title, subtitle, fmt=lambda v: f"{v:,.1f}", y_fmt=None):
     """One bar group per machine, one bar per Parquet choice."""
     extra = subtitle.count("\n")
-    fig, ax = plt.subplots(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 4.2 + 0.22 * extra), dpi=200)
+    fig, ax = plt.subplots(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 3.9 + 0.22 * extra), dpi=200)
     grouped_bars(ax, len(labels), vals)
     style_axis(ax)
     if y_fmt is not None:
@@ -221,7 +221,7 @@ def grouped_avg_chart(path, labels, vals, y_label, title, subtitle, fmt=lambda v
     ax.set_ylabel(y_label, fontsize=10)
     choice_legend(ax)
     add_titles(fig, title, subtitle)
-    fig.tight_layout(rect=(0, 0, 1, 0.86 - 0.045 * extra))
+    fig.tight_layout(rect=(0, 0, 1, 0.91 - 0.045 * extra))
     fig.savefig(path, facecolor="white")
     plt.close(fig)
 
@@ -234,7 +234,7 @@ def grouped_broken_chart(path, labels, vals, outlier, y_label, title, subtitle, 
     hi_b = max(rest) * 1.35
     extra = subtitle.count("\n")
 
-    fig = plt.figure(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 4.6 + 0.22 * extra), dpi=200)
+    fig = plt.figure(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 4.3 + 0.22 * extra), dpi=200)
     gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2.6], hspace=0.08)
     ax_t = fig.add_subplot(gs[0])
     ax_b = fig.add_subplot(gs[1], sharex=ax_t)
@@ -266,7 +266,7 @@ def grouped_broken_chart(path, labels, vals, outlier, y_label, title, subtitle, 
     choice_legend(ax_t)
     fig.supylabel(y_label, fontsize=10, x=0.02)
     add_titles(fig, title, subtitle)
-    gs.tight_layout(fig, rect=(0.03, 0, 1, 0.86 - 0.045 * extra))
+    gs.tight_layout(fig, rect=(0.03, 0, 1, 0.91 - 0.045 * extra))
     fig.savefig(path, facecolor="white")
     plt.close(fig)
 
@@ -306,14 +306,9 @@ def main():
     labels = [report.stem for report, *_ in machines]
     sizes = [len(datasets) for _, _, datasets, _ in machines]
     if len(set(sizes)) == 1:
-        mean_line = f"Arithmetic mean over {sizes[0]} datasets per machine"
-        machine_lines = [f"{report.stem}: {cpu}" if cpu else report.stem
-                         for report, cpu, _, _ in machines]
+        avg_subtitle = f"Arithmetic mean over {sizes[0]} datasets per machine"
     else:
-        mean_line = "Arithmetic mean per machine"
-        machine_lines = [f"{report.stem}: {cpu} ({n} datasets)" if cpu else f"{report.stem} ({n} datasets)"
-                         for (report, cpu, _, _), n in zip(machines, sizes)]
-    avg_subtitle = "\n".join([mean_line, *machine_lines])
+        avg_subtitle = "Arithmetic mean per machine"
 
     for metric, stem, _, avg_title, y_label, _ in metrics:
         vals = [[table[AVG_KEY][c][metric] for c in CHOICES] for _, _, _, table in machines]
@@ -336,7 +331,7 @@ def main():
             head = f"Decoding {n_rows} random rows" + (f" from {dataset}" if dataset else "")
         else:
             head = "Decoding random rows"
-        ra_subtitle = "\n".join([head, *[f"{stem}: {cpu}" if cpu else stem for stem, cpu, _ in ras]])
+        ra_subtitle = head
         ra_path = Path("diagrams") / "avg_random_access.png"
         kwargs = dict(fmt=human, y_fmt=EngFormatter(places=0, sep=""))
         outlier = pick_outlier(vals)
