@@ -20,7 +20,7 @@ by benchmark.sh and renders, per report (into diagrams/<stem>/):
 and, combined across ALL reports (into diagrams/): avg_compression_speed.png,
 avg_decompression_speed.png, avg_compression_ratio.png, and — for reports
 with a "Random access" table — avg_random_access.png. Each combined chart has
-one bar group per machine, three bars (PLAIN, PLAIN + ZSTD, ALP) per group,
+one bar group per machine, two bars (PLAIN + ZSTD, ALP) per group,
 to show whether the shape holds across machines.
 
 Compressed size is plotted as compression ratio = uncompressed size /
@@ -42,6 +42,7 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import EngFormatter
 
 CHOICES = ["PLAIN", "PLAIN + ZSTD", "ALP"]
+AVG_CHOICES = CHOICES[1:]  # combined average charts omit PLAIN
 COLORS = {"PLAIN": "#2a78d6", "PLAIN + ZSTD": "#eb6834", "ALP": "#1baf7a"}
 INK, MUTED, GRID, BASE = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7"
 AVG_KEY = "ALL AVG."
@@ -174,31 +175,31 @@ def per_dataset_chart(path, datasets, table, metric, choices, title, subtitle, y
 
 
 def grouped_bars(ax, n_groups, vals):
-    n = len(CHOICES)
+    n = len(AVG_CHOICES)
     width = 0.8 / n
-    for j, choice in enumerate(CHOICES):
+    for j, choice in enumerate(AVG_CHOICES):
         xs = [i + (j - (n - 1) / 2) * width for i in range(n_groups)]
         ax.bar(xs, [vals[i][j] for i in range(n_groups)],
                width=width * 0.9, color=COLORS[choice], zorder=3)
 
 
 def bar_positions(n_groups):
-    n = len(CHOICES)
+    n = len(AVG_CHOICES)
     width = 0.8 / n
     return [(i + (j - (n - 1) / 2) * width, i, j) for i in range(n_groups) for j in range(n)]
 
 
 def choice_legend(ax):
-    ax.legend(handles=[Patch(color=COLORS[c], label=c) for c in CHOICES],
-              loc="lower right", bbox_to_anchor=(1, 1.0), ncol=len(CHOICES),
+    ax.legend(handles=[Patch(color=COLORS[c], label=c) for c in AVG_CHOICES],
+              loc="lower right", bbox_to_anchor=(1, 1.0), ncol=len(AVG_CHOICES),
               frameon=False, fontsize=9, borderaxespad=0)
 
 
 def pick_outlier(vals):
     """Return the choice index whose bars dwarf (>3x) every other bar on
     every machine, or None if no choice does."""
-    for j in range(len(CHOICES)):
-        others = [row[k] for row in vals for k in range(len(CHOICES)) if k != j]
+    for j in range(len(AVG_CHOICES)):
+        others = [row[k] for row in vals for k in range(len(AVG_CHOICES)) if k != j]
         if min(row[j] for row in vals) > 3 * max(others):
             return j
     return None
@@ -311,7 +312,7 @@ def main():
         avg_subtitle = "Arithmetic mean per machine"
 
     for metric, stem, _, avg_title, y_label, _ in metrics:
-        vals = [[table[AVG_KEY][c][metric] for c in CHOICES] for _, _, _, table in machines]
+        vals = [[table[AVG_KEY][c][metric] for c in AVG_CHOICES] for _, _, _, table in machines]
         avg_path = Path("diagrams") / f"avg_{stem}.png"
         outlier = pick_outlier(vals)
         if outlier is None:
@@ -324,7 +325,7 @@ def main():
     ras = [(stem, cpu, ra) for stem, cpu, ra in ras if ra is not None]
     if ras:
         ra_labels = [stem for stem, _, _ in ras]
-        vals = [[rows_per_sec[c] for c in CHOICES] for _, _, (_, _, rows_per_sec) in ras]
+        vals = [[rows_per_sec[c] for c in AVG_CHOICES] for _, _, (_, _, rows_per_sec) in ras]
         heads = {(n_rows, dataset) for _, _, (n_rows, dataset, _) in ras}
         if len(heads) == 1:
             n_rows, dataset = heads.pop()
