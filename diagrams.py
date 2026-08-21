@@ -47,6 +47,9 @@ COLORS = {"PLAIN": "#2a78d6", "PLAIN + ZSTD": "#eb6834", "ALP": "#1baf7a"}
 INK, MUTED, GRID, BASE = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7"
 AVG_KEY = "ALL AVG."
 RATIO_CAP = 10  # per-dataset compression ratio cap; gov26/31/40 reach ~300
+# combined average charts share one figure size, broken y-axis or not, so that
+# they line up when rendered side by side at equal width
+AVG_FIG_H = 3.9
 SPEED_Y = "GB/s (higher is better)"
 RATIO_Y = "compression ratio (higher is better)"
 ROWS_Y = "rows per second (higher is better)"
@@ -183,6 +186,10 @@ def grouped_bars(ax, n_groups, vals):
                width=width * 0.9, color=COLORS[choice], zorder=3)
 
 
+def avg_fig_w(labels):
+    return max(5.4, 2.4 * len(labels) + 1.6)
+
+
 def bar_positions(n_groups):
     n = len(AVG_CHOICES)
     width = 0.8 / n
@@ -208,7 +215,7 @@ def pick_outlier(vals):
 def grouped_avg_chart(path, labels, vals, y_label, title, subtitle, fmt=lambda v: f"{v:,.1f}", y_fmt=None):
     """One bar group per machine, one bar per Parquet choice."""
     extra = subtitle.count("\n")
-    fig, ax = plt.subplots(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 3.9 + 0.22 * extra), dpi=200)
+    fig, ax = plt.subplots(figsize=(avg_fig_w(labels), AVG_FIG_H + 0.22 * extra), dpi=200)
     grouped_bars(ax, len(labels), vals)
     style_axis(ax)
     if y_fmt is not None:
@@ -235,7 +242,7 @@ def grouped_broken_chart(path, labels, vals, outlier, y_label, title, subtitle, 
     hi_b = max(rest) * 1.35
     extra = subtitle.count("\n")
 
-    fig = plt.figure(figsize=(max(5.4, 2.4 * len(labels) + 1.6), 4.3 + 0.22 * extra), dpi=200)
+    fig = plt.figure(figsize=(avg_fig_w(labels), AVG_FIG_H + 0.22 * extra), dpi=200)
     gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2.6], hspace=0.08)
     ax_t = fig.add_subplot(gs[0])
     ax_b = fig.add_subplot(gs[1], sharex=ax_t)
